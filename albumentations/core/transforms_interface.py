@@ -393,7 +393,26 @@ class BasicTransform(Serializable, metaclass=CombinedMeta):
         if "volume" in data:
             shape = data["volume"][0].shape  # Take first slice of volume
         elif "volumes" in data:
-            shape = data["volumes"][0][0].shape  # Take first slice of first volume
+            volumes = data["volumes"]
+            if isinstance(volumes, np.ndarray):
+                shape = volumes[0][0].shape  # Take first slice of first volume
+            else:
+                # List of volumes, possibly with missing (None) modalities
+                first_volume = next((v for v in volumes if v is not None), None)
+                if first_volume is None:
+                    raise ValueError("All volumes are None; at least one modality must be present")
+                shape = first_volume[0].shape
+        elif "mask3d" in data:
+            shape = data["mask3d"][0].shape  # Take first slice of 3D mask
+        elif "masks3d" in data:
+            masks3d = data["masks3d"]
+            if isinstance(masks3d, np.ndarray):
+                shape = masks3d[0][0].shape  # Take first slice of first 3D mask
+            else:
+                first_mask = next((m for m in masks3d if m is not None), None)
+                if first_mask is None:
+                    raise ValueError("All 3D masks are None; at least one mask must be present")
+                shape = first_mask[0].shape
         elif "image" in data:
             shape = data["image"].shape
         else:
@@ -944,7 +963,15 @@ class Transform3D(DualTransform):
         mask: 3D numpy array of shape (D, H, W)
         masks: Batch of 3D arrays of shape (N, D, H, W)
         keypoints: 3D numpy array of shape (N, 3)
+
+    Class Attributes:
+        is_invertible (bool): Whether the transform can be exactly undone from its
+            recorded parameters (up to interpolation error). Transforms that destroy
+            information (e.g. crops, dropout) must keep this set to False.
+
     """
+
+    is_invertible: bool = False
 
     def apply_to_volume(self, volume: np.ndarray, *args: Any, **params: Any) -> np.ndarray:
         """Apply transform to single 3D volume."""

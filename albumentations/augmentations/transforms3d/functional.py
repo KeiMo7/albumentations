@@ -12,9 +12,12 @@ import random
 from typing import Literal
 
 import numpy as np
+from scipy import ndimage
 
 from albumentations.augmentations.utils import handle_empty_array
 from albumentations.core.type_definitions import NUM_VOLUME_DIMENSIONS
+
+NUM_SPATIAL_DIMENSIONS = 3
 
 
 def adjust_padding_by_position3d(
@@ -391,3 +394,440 @@ def transform_cube_keypoints(
     result[:, :3] = xyz
 
     return result
+
+
+def get_rotation_matrix_3d(angles_xyz: tuple[float, float, float]) -> np.ndarray:
+    """Build a 3D rotation matrix from per-axis angles.
+
+    Args:
+        angles_xyz (tuple[float, float, float]): Rotation angles in degrees around
+            the x, y and z axes respectively. A rotation around the z axis takes
+            place in the xy (axial) plane, around y in the xz (coronal) plane and
+            around x in the yz (sagittal) plane.
+
+    Returns:
+        np.ndarray: Rotation matrix of shape (3, 3) in (x, y, z) coordinates.
+            The combined rotation applies x first, then y, then z: ``R = Rz @ Ry @ Rx``.
+
+    """
+    ax, ay, az = (np.deg2rad(angle) for angle in angles_xyz)
+    cx, sx = np.cos(ax), np.sin(ax)
+    cy, sy = np.cos(ay), np.sin(ay)
+    cz, sz = np.cos(az), np.sin(az)
+
+    rotation_x = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    rotation_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    rotation_z = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+
+    return rotation_z @ rotation_y @ rotation_x
+
+
+def get_affine3d_forward_matrix(
+    rotation_matrix: np.ndarray,
+    scale: float,
+    flip_axes: tuple[bool, bool, bool],
+) -> np.ndarray:
+    """Build the forward affine matrix mapping input to output coordinates.
+
+    The forward transform is ``p_out = A @ (p_in - center) + center`` with
+    ``A = scale * R @ F`` where ``F`` is a diagonal matrix of +/-1 flips.
+
+    Args:
+        rotation_matrix (np.ndarray): Rotation matrix (3, 3) in (x, y, z) coordinates.
+        scale (float): Isotropic scale factor. Must be non-zero.
+        flip_axes (tuple[bool, bool, bool]): Whether to flip the x, y and z axes.
+
+    Returns:
+        np.ndarray: Forward affine matrix of shape (3, 3) in (x, y, z) coordinates.
+
+    """
+    if scale == 0:
+        raise ValueError("Scale must be non-zero for a 3D affine transform")
+    flips = np.array([-1.0 if flip else 1.0 for flip in flip_axes])
+    return scale * rotation_matrix @ np.diag(flips)
+
+
+def resampling_map_from_forward(
+    forward_matrix: np.ndarray,
+    center_xyz: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a forward affine matrix to a resampling map in voxel index order.
+
+    Resampling requires the output-to-input mapping ``p_in = M @ p_out + b``
+    expressed in (z, y, x) index coordinates, which is what
+    ``scipy.ndimage.affine_transform`` consumes.
+
+    Args:
+        forward_matrix (np.ndarray): Forward affine matrix (3, 3) in (x, y, z) coordinates.
+        center_xyz (tuple[float, float, float]): Center of the transform in (x, y, z) coordinates.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: ``(matrix, offset)`` in (z, y, x) index order such that
+            ``p_in = matrix @ p_out + offset``.
+
+    """
+    center = np.asarray(center_xyz, dtype=np.float64)
+    inverse = np.linalg.inv(forward_matrix)
+    offset_xyz = center - inverse @ center
+    # Convert (x, y, z) -> (z, y, x): P @ M @ P with P the reversal permutation (P = P^-1)
+    matrix_zyx = inverse[::-1, ::-1]
+    offset_zyx = offset_xyz[::-1]
+    return matrix_zyx, offset_zyx
+
+
+def invert_affine3d(
+    matrix: np.ndarray,
+    offset: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Invert a resampling map.
+
+    Args:
+        matrix (np.ndarray): Resampling matrix (3, 3) such that ``p_in = matrix @ p_out + offset``.
+        offset (np.ndarray): Resampling offset (3,).
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: ``(matrix, offset)`` of the inverse resampling map.
+            Applying it to the transformed volume restores the original space
+            (up to interpolation error).
+
+    """
+    inverse = np.linalg.inv(matrix)
+    return inverse, -inverse @ offset
+
+
+def _validate_interpolation(interpolation: int) -> None:
+    if interpolation not in {0, 1}:
+        raise ValueError(
+            f"Only nearest-neighbor (0) and linear (1) interpolation are supported for 3D "
+            f"geometric transforms, got {interpolation}. Higher-order splines are not "
+            f"supported because they cannot be applied seamlessly in chunks.",
+        )
+
+
+def _iter_depth_slabs(
+    shape_zyx: tuple[int, int, int],
+    max_chunk_voxels: int | None,
+) -> list[tuple[int, int]]:
+    """Split the depth axis into slabs of at most max_chunk_voxels voxels each.
+
+    Args:
+        shape_zyx (tuple[int, int, int]): Spatial shape (depth, height, width).
+        max_chunk_voxels (int | None): Maximum number of voxels per slab. If None,
+            a single slab covering the whole volume is returned.
+
+    Returns:
+        list[tuple[int, int]]: List of (z_start, z_stop) depth ranges.
+
+    """
+    depth, height, width = shape_zyx
+    if max_chunk_voxels is None:
+        return [(0, depth)]
+    if max_chunk_voxels < 1:
+        raise ValueError(f"max_chunk_voxels must be >= 1, got {max_chunk_voxels}")
+    slab_depth = max(1, max_chunk_voxels // (height * width))
+    return [(z0, min(depth, z0 + slab_depth)) for z0 in range(0, depth, slab_depth)]
+
+
+def _split_channels(volume: np.ndarray) -> tuple[list[np.ndarray], tuple[int, ...]]:
+    """Split a (D, H, W) or (D, H, W, C) volume into a list of (D, H, W) channel arrays."""
+    if volume.ndim == NUM_SPATIAL_DIMENSIONS:
+        return [volume], ()
+    if volume.ndim == NUM_VOLUME_DIMENSIONS:
+        return [volume[..., c] for c in range(volume.shape[-1])], (volume.shape[-1],)
+    raise ValueError(f"Volume must be 3D (D, H, W) or 4D (D, H, W, C), got shape {volume.shape}")
+
+
+def _normalize_fill(fill: tuple[float, ...] | float, num_channels: int) -> list[float]:
+    """Broadcast a scalar or per-channel fill value to a per-channel list."""
+    if isinstance(fill, (tuple, list)):
+        if len(fill) != num_channels:
+            raise ValueError(
+                f"Fill value has {len(fill)} entries but the volume has {num_channels} channel(s). "
+                f"Pass a scalar or one value per channel.",
+            )
+        return [float(v) for v in fill]
+    return [float(fill)] * num_channels
+
+
+def warp_affine3d(
+    volume: np.ndarray,
+    matrix: np.ndarray,
+    offset: np.ndarray,
+    interpolation: int,
+    fill: tuple[float, ...] | float,
+    max_chunk_voxels: int | None = None,
+) -> np.ndarray:
+    """Warp a 3D volume with an affine resampling map, optionally in depth slabs.
+
+    Applies ``p_in = matrix @ p_out + offset`` to resample the volume. Only the
+    three spatial axes are transformed; trailing channel axes are preserved and
+    every channel is warped with the same map, so multi-channel and multi-modal
+    data stay aligned.
+
+    Args:
+        volume (np.ndarray): Input volume of shape (D, H, W) or (D, H, W, C).
+        matrix (np.ndarray): Resampling matrix (3, 3) in (z, y, x) index order.
+        offset (np.ndarray): Resampling offset (3,) in (z, y, x) index order.
+        interpolation (int): 0 (nearest neighbor) or 1 (linear). Use 0 for label masks
+            so no intermediate class values are introduced.
+        fill (tuple[float, ...] | float): Value used for voxels sampled outside the volume.
+        max_chunk_voxels (int | None): If set, the output is computed in depth slabs of at
+            most this many voxels, bounding peak memory. The resampling map is a global
+            function of the output coordinates, so slab boundaries are seamless and the
+            result is identical to processing the whole volume at once.
+
+    Returns:
+        np.ndarray: Warped volume with the same shape and dtype as the input.
+
+    """
+    _validate_interpolation(interpolation)
+    matrix = np.asarray(matrix, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    if matrix.shape != (NUM_SPATIAL_DIMENSIONS, NUM_SPATIAL_DIMENSIONS) or offset.shape != (NUM_SPATIAL_DIMENSIONS,):
+        raise ValueError(f"matrix must have shape (3, 3) and offset shape (3,), got {matrix.shape} and {offset.shape}")
+
+    channels, channel_shape = _split_channels(volume)
+    fills = _normalize_fill(fill, len(channels))
+
+    spatial_shape = volume.shape[:3]
+    result = np.empty(spatial_shape + channel_shape, dtype=volume.dtype)
+
+    for z0, z1 in _iter_depth_slabs(spatial_shape, max_chunk_voxels):
+        # Shift the map so that slab-local coordinates index into the global output space
+        slab_offset = offset + matrix @ np.array([z0, 0.0, 0.0])
+        slab_shape = (z1 - z0, *spatial_shape[1:])
+        for c, (channel, cval) in enumerate(zip(channels, fills)):
+            slab_out = result[z0:z1] if not channel_shape else result[z0:z1, ..., c]
+            ndimage.affine_transform(
+                channel,
+                matrix,
+                offset=slab_offset,
+                output_shape=slab_shape,
+                output=slab_out,
+                order=interpolation,
+                mode="constant",
+                cval=cval,
+                prefilter=False,
+            )
+    return result
+
+
+def generate_elastic_displacement_grid3d(
+    shape_zyx: tuple[int, int, int],
+    alpha: float,
+    sigma: float,
+    random_generator: np.random.Generator,
+) -> np.ndarray:
+    """Generate a coarse random displacement grid for 3D elastic deformation.
+
+    Displacements are sampled at control points spaced roughly ``sigma`` voxels
+    apart; the dense displacement field is obtained by trilinear interpolation
+    of this grid, so the field is smooth and continuous across the whole volume
+    (and across chunk boundaries when processing in slabs).
+
+    Args:
+        shape_zyx (tuple[int, int, int]): Spatial shape (depth, height, width) of the volume.
+        alpha (float): Maximum displacement in voxels (sampled uniformly in [-alpha, alpha]).
+        sigma (float): Spacing between control points in voxels. Must be >= 1.
+        random_generator (np.random.Generator): Random number generator.
+
+    Returns:
+        np.ndarray: Displacement grid of shape (3, nz, ny, nx), float32, where the first
+            axis holds the z, y and x displacement components and control point (i, j, k)
+            corresponds to voxel coordinate (i * sigma, j * sigma, k * sigma).
+
+    """
+    if sigma < 1:
+        raise ValueError(f"sigma must be >= 1, got {sigma}")
+    grid_shape = tuple(max(2, int(np.ceil(d / sigma)) + 1) for d in shape_zyx)
+    return random_generator.uniform(-alpha, alpha, size=(NUM_SPATIAL_DIMENSIONS, *grid_shape)).astype(np.float32)
+
+
+def warp_elastic3d(
+    volume: np.ndarray,
+    displacement_grid: np.ndarray,
+    grid_step: float,
+    interpolation: int,
+    fill: tuple[float, ...] | float,
+    max_chunk_voxels: int | None = None,
+) -> np.ndarray:
+    """Warp a 3D volume with a coarse displacement grid, optionally in depth slabs.
+
+    Args:
+        volume (np.ndarray): Input volume of shape (D, H, W) or (D, H, W, C).
+        displacement_grid (np.ndarray): Grid of shape (3, nz, ny, nx) as produced by
+            ``generate_elastic_displacement_grid3d``. The same grid must be used for the
+            volume and its mask to keep them aligned.
+        grid_step (float): Spacing between control points in voxels.
+        interpolation (int): 0 (nearest neighbor) or 1 (linear). Use 0 for label masks.
+        fill (tuple[float, ...] | float): Value used for voxels sampled outside the volume.
+        max_chunk_voxels (int | None): If set, the output is computed in depth slabs of at
+            most this many voxels. Because displacements are interpolated from the shared
+            global grid, slab boundaries are seamless and the result is identical to
+            processing the whole volume at once.
+
+    Returns:
+        np.ndarray: Warped volume with the same shape and dtype as the input.
+
+    """
+    _validate_interpolation(interpolation)
+    if displacement_grid.ndim != NUM_VOLUME_DIMENSIONS or displacement_grid.shape[0] != NUM_SPATIAL_DIMENSIONS:
+        raise ValueError(f"displacement_grid must have shape (3, nz, ny, nx), got {displacement_grid.shape}")
+
+    channels, channel_shape = _split_channels(volume)
+    fills = _normalize_fill(fill, len(channels))
+
+    spatial_shape = volume.shape[:3]
+    height, width = spatial_shape[1:]
+    result = np.empty(spatial_shape + channel_shape, dtype=volume.dtype)
+
+    yy, xx = np.meshgrid(
+        np.arange(height, dtype=np.float32),
+        np.arange(width, dtype=np.float32),
+        indexing="ij",
+    )
+
+    for z0, z1 in _iter_depth_slabs(spatial_shape, max_chunk_voxels):
+        zz = np.arange(z0, z1, dtype=np.float32)[:, None, None]
+        zz, yy3, xx3 = np.broadcast_arrays(zz, yy[None], xx[None])
+        grid_coords = [zz / grid_step, yy3 / grid_step, xx3 / grid_step]
+        # Interpolate the shared global displacement grid at this slab's coordinates
+        sample_coords = [
+            coord + ndimage.map_coordinates(displacement_grid[c], grid_coords, order=1, mode="nearest")
+            for c, coord in enumerate((zz, yy3, xx3))
+        ]
+        for c, (channel, cval) in enumerate(zip(channels, fills)):
+            slab_out = result[z0:z1] if not channel_shape else result[z0:z1, ..., c]
+            ndimage.map_coordinates(
+                channel,
+                sample_coords,
+                output=slab_out,
+                order=interpolation,
+                mode="constant",
+                cval=cval,
+                prefilter=False,
+            )
+    return result
+
+
+def elastic_displacement_at_points3d(
+    displacement_grid: np.ndarray,
+    grid_step: float,
+    points_zyx: np.ndarray,
+) -> np.ndarray:
+    """Sample the displacement field at arbitrary points.
+
+    Args:
+        displacement_grid (np.ndarray): Grid of shape (3, nz, ny, nx).
+        grid_step (float): Spacing between control points in voxels.
+        points_zyx (np.ndarray): Points of shape (N, 3) in (z, y, x) voxel coordinates.
+
+    Returns:
+        np.ndarray: Displacements of shape (N, 3) in (z, y, x) order.
+
+    """
+    if points_zyx.size == 0:
+        return np.zeros((0, NUM_SPATIAL_DIMENSIONS), dtype=np.float32)
+    grid_coords = np.ascontiguousarray(points_zyx.T / grid_step)
+    return np.stack(
+        [ndimage.map_coordinates(displacement_grid[c], grid_coords, order=1, mode="nearest") for c in range(3)],
+        axis=1,
+    )
+
+
+@handle_empty_array("keypoints")
+def apply_affine3d_to_keypoints(
+    keypoints: np.ndarray,
+    matrix: np.ndarray,
+    offset: np.ndarray,
+) -> np.ndarray:
+    """Apply the forward 3D affine transform to keypoints.
+
+    Args:
+        keypoints (np.ndarray): Array of keypoints with shape (num_keypoints, 3+).
+            The first three columns are x, y, z coordinates.
+        matrix (np.ndarray): Resampling matrix (3, 3) in (z, y, x) index order, as used
+            for warping the volume (``p_in = matrix @ p_out + offset``).
+        offset (np.ndarray): Resampling offset (3,) in (z, y, x) index order.
+
+    Returns:
+        np.ndarray: Transformed keypoints with the same shape as the input.
+
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    inverse = np.linalg.inv(matrix)
+
+    result = keypoints.copy().astype(np.float64)
+    # Keypoints are (x, y, z); the resampling map works in (z, y, x) index order
+    zyx = result[:, :3][:, ::-1]
+    # Forward map: p_out = M^-1 @ (p_in - offset)
+    transformed = (zyx - offset) @ inverse.T
+    result[:, :3] = transformed[:, ::-1]
+    return result.astype(keypoints.dtype) if np.issubdtype(keypoints.dtype, np.integer) else result
+
+
+@handle_empty_array("keypoints")
+def apply_elastic3d_to_keypoints(
+    keypoints: np.ndarray,
+    displacement_grid: np.ndarray,
+    grid_step: float,
+) -> np.ndarray:
+    """Apply a 3D elastic displacement field to keypoints.
+
+    Args:
+        keypoints (np.ndarray): Array of keypoints with shape (num_keypoints, 3+).
+            The first three columns are x, y, z coordinates.
+        displacement_grid (np.ndarray): Grid of shape (3, nz, ny, nx).
+        grid_step (float): Spacing between control points in voxels.
+
+    Returns:
+        np.ndarray: Displaced keypoints with the same shape as the input.
+
+    """
+    result = keypoints.copy()
+    zyx = result[:, :3][:, ::-1].astype(np.float32)
+    displacement = elastic_displacement_at_points3d(displacement_grid, grid_step, zyx)
+    result[:, :3] = (zyx + displacement)[:, ::-1]
+    return result
+
+
+_CUBE_INVERSE_TABLE: list[int] | None = None
+
+
+def _build_cube_inverse_table() -> list[int]:
+    """Build the inverse lookup table for the 48 cubic symmetry transformations.
+
+    The 48 transformations form the octahedral group, so every transformation has
+    its inverse inside the group. The table is computed once by probing with a
+    small asymmetric-valued cube.
+    """
+    probe = np.arange(27).reshape(3, 3, 3)
+    transformed = [transform_cube(probe, index) for index in range(48)]
+    table = []
+    for index in range(48):
+        for candidate in range(48):
+            if np.array_equal(transform_cube(transformed[index], candidate), probe):
+                table.append(candidate)
+                break
+        else:  # pragma: no cover - the cube group is closed under inversion
+            raise ValueError(f"No inverse found for cube transformation {index}")
+    return table
+
+
+def invert_cube_index(index: int) -> int:
+    """Return the index of the inverse cubic symmetry transformation.
+
+    Args:
+        index (int): Transformation index (0-47) as used by ``transform_cube``.
+
+    Returns:
+        int: Index j such that ``transform_cube(transform_cube(x, index), j) == x``.
+
+    """
+    if not (0 <= index < 48):
+        raise ValueError("Index must be between 0 and 47")
+    global _CUBE_INVERSE_TABLE
+    if _CUBE_INVERSE_TABLE is None:
+        _CUBE_INVERSE_TABLE = _build_cube_inverse_table()
+    return _CUBE_INVERSE_TABLE[index]

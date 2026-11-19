@@ -19,5 +19,6 @@ from .other.type_transform import *
 from .pixel.transforms import *
 from .spectrogram.transform import *
 from .text.transforms import *
+from .transforms3d.geometric import *
 from .transforms3d.transforms import *
 from .utils import *

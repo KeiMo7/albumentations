@@ -849,6 +849,8 @@ def test_center_crop3d_keypoints(
             A.RandomCrop3D: {"size": (4, 4, 4)},
             A.CenterCrop3D: {"size": (4, 4, 4)},
             A.CubicSymmetry: {},
+            A.Affine3D: {},  # identity by default: keypoints stay exact
+            A.ElasticTransform3D: {"alpha": 0.0},  # zero displacement: keypoints stay exact
         },
         except_augmentations={
             A.CoarseDropout3D

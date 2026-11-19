@@ -1367,6 +1367,8 @@ class CubicSymmetry(Transform3D):
 
     _targets = (Targets.VOLUME, Targets.MASK3D, Targets.KEYPOINTS)
 
+    is_invertible = True
+
     def __init__(
         self,
         p: float = 1.0,
@@ -1420,3 +1422,21 @@ class CubicSymmetry(Transform3D):
 
         """
         return f3d.transform_cube_keypoints(keypoints, index, volume_shape=params["volume_shape"])
+
+    def get_inverse_params(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Get the parameters of the inverse cubic symmetry transformation.
+
+        Args:
+            params (dict[str, Any] | None): Parameters of the applied transform.
+                If None, the parameters of the last application are used.
+
+        Returns:
+            dict[str, Any]: Dictionary with the "index" of the inverse transformation
+                and the "volume_shape", suitable for ``apply_to_volume``/``apply_to_keypoints``.
+                Applying it restores the original data exactly (no interpolation is involved).
+
+        """
+        params = self.params if params is None else params
+        if not params or "index" not in params:
+            raise ValueError("No applied parameters available; apply the transform first or pass params explicitly.")
+        return {"index": f3d.invert_cube_index(params["index"]), "volume_shape": params["volume_shape"]}

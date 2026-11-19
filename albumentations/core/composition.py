@@ -1255,6 +1255,17 @@ class Compose(BaseCompose, HubMixin):
             return None if shape is None else shape
 
         if internal_name in {"volumes", "masks3d"}:  # Group these together
+            if isinstance(data, (list, tuple)):
+                # List of volumes/masks, possibly with missing (None) modalities
+                shapes = [item.shape for item in data if item is not None]
+                if not shapes:
+                    return None
+                first_shape = shapes[0]
+                if any(shape != first_shape for shape in shapes):
+                    raise ValueError(f"All non-empty arrays in {data_name} must have the same shape")
+                if len(first_shape) not in {3, 4}:  # (D,H,W) or (D,H,W,C)
+                    raise TypeError(f"Elements of {data_name} must be 3D or 4D arrays")
+                return (len(data), *first_shape)  # Synthesize (N, D, H, W[, C])
             if not isinstance(data, np.ndarray):
                 raise TypeError(f"{data_name} must be numpy array type")
             if data.ndim not in {4, 5}:  # (N,D,H,W) or (N,D,H,W,C)
