@@ -111,6 +111,7 @@ Here is an example of how you can apply some [pixel-level](#pixel-level-transfor
   - [Installation](#installation)
   - [Documentation](#documentation)
   - [A simple example](#a-simple-example)
+  - [Deterministic parallel augmentation](docs/parallel_augmentation.md) (`A.parallel_augment`: order-independent, reproducible multi-process augmentation)
   - [Getting started](#getting-started)
     - [I am new to image augmentation](#i-am-new-to-image-augmentation)
     - [I want to use Albumentations for the specific task such as classification or segmentation](#i-want-to-use-albumentations-for-the-specific-task-such-as-classification-or-segmentation)

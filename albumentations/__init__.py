@@ -19,6 +19,13 @@ from .augmentations import *
 from .core.composition import *
 from .core.serialization import *
 from .core.transforms_interface import *
+from .parallel import (
+    AugmentationFailure,
+    ParallelAugmentationResult,
+    benchmark_parallel_augment,
+    derive_image_seed,
+    parallel_augment,
+)
 
 with suppress(ImportError):
     from .pytorch import *
